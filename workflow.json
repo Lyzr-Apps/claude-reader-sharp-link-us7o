@@ -1,0 +1,11 @@
+{
+  "nodes": [
+    {"id": "input_node", "type": "Input", "label": "User Question", "nodeCategory": "input"},
+    {"id": "book_chat_agent", "type": "Agent", "label": "Book Chat Agent", "nodeCategory": "agent"},
+    {"id": "output_node", "type": "Output", "label": "Agent Response", "nodeCategory": "end"}
+  ],
+  "edges": [
+    {"source": "input_node", "target": "book_chat_agent"},
+    {"source": "book_chat_agent", "target": "output_node"}
+  ]
+}

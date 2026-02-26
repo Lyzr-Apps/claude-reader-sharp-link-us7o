@@ -1,0 +1,26 @@
+{
+  "agent_name": "Book Chat Agent",
+  "agent_id": "699fb1fd1d5430ccdd32597d",
+  "description": "Answers user questions about the currently loaded book. Searches book content via RAG to provide summaries, explain passages, define terms, and help with comprehension.",
+  "agent_type": "json",
+  "accessor": "result",
+  "auto_generated": true,
+  "response_schema": {
+    "answer": "string",
+    "sources": [
+      "string"
+    ],
+    "follow_up_questions": [
+      "string"
+    ]
+  },
+  "example_response": {
+    "answer": "The agent's answer to the user's question about the book",
+    "sources": [
+      "sample string"
+    ],
+    "follow_up_questions": [
+      "sample string"
+    ]
+  }
+}

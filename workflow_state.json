@@ -1,0 +1,10 @@
+{
+  "agents": {
+    "book_chat_agent": {
+      "agent_id": "699fb1fd1d5430ccdd32597d",
+      "name": "Book Chat Agent",
+      "rag_id": "699fb1edf572c99c0ffb74f0",
+      "rag_name": "bookshelflibrary42na"
+    }
+  }
+}
