@@ -18,15 +18,18 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription } from '
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog'
 import { Collapsible, CollapsibleTrigger, CollapsibleContent } from '@/components/ui/collapsible'
 import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from '@/components/ui/tooltip'
+import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { cn } from '@/lib/utils'
-import { FiBook, FiBookOpen, FiEdit3, FiUpload, FiSearch, FiSettings, FiMessageSquare, FiSend, FiChevronLeft, FiChevronRight, FiChevronDown, FiBookmark, FiList, FiGrid, FiX, FiCopy, FiTrash2, FiDownload, FiMenu, FiClock, FiFileText } from 'react-icons/fi'
+import { FiBook, FiBookOpen, FiEdit3, FiUpload, FiSearch, FiSettings, FiMessageSquare, FiSend, FiChevronLeft, FiChevronRight, FiChevronDown, FiBookmark, FiList, FiGrid, FiX, FiCopy, FiTrash2, FiDownload, FiMenu, FiClock, FiFileText, FiZoomIn, FiZoomOut, FiMaximize2, FiFile, FiLoader } from 'react-icons/fi'
 import { HiOutlineSparkles } from 'react-icons/hi2'
 import { BiHighlight } from 'react-icons/bi'
 
 // ===== CONSTANTS =====
 const AGENT_ID = '699fb1fd1d5430ccdd32597d'
 const RAG_ID = '699fb1edf572c99c0ffb74f0'
-const PAGES_CHAR_LIMIT = 2000
+const PDFJS_CDN = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'
+const PDFJS_WORKER_CDN = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
+const MAMMOTH_CDN = 'https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js'
 
 // ===== TYPES =====
 interface Book {
@@ -34,7 +37,12 @@ interface Book {
   title: string
   author: string
   fileName: string
+  fileType: 'pdf' | 'docx' | 'txt'
   content: string
+  htmlContent: string
+  pdfDataBase64: string
+  totalPdfPages: number
+  pages: string[]
   chapters: Chapter[]
   progress: number
   lastRead: string
@@ -42,6 +50,7 @@ interface Book {
   coverColor: string
   bookmarks: number[]
   currentPage: number
+  fileSize: number
 }
 
 interface Chapter {
@@ -68,6 +77,252 @@ interface ChatMessage {
   timestamp: string
 }
 
+// ===== CDN LOADERS =====
+async function loadPdfJs(): Promise<any> {
+  if (typeof window !== 'undefined' && (window as any).pdfjsLib) return (window as any).pdfjsLib
+  return new Promise((resolve, reject) => {
+    const script = document.createElement('script')
+    script.src = PDFJS_CDN
+    script.onload = () => {
+      const lib = (window as any).pdfjsLib
+      if (lib) {
+        lib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_CDN
+        resolve(lib)
+      } else {
+        reject(new Error('PDF.js failed to load'))
+      }
+    }
+    script.onerror = () => reject(new Error('Failed to load PDF.js from CDN'))
+    document.head.appendChild(script)
+  })
+}
+
+async function loadMammoth(): Promise<any> {
+  if (typeof window !== 'undefined' && (window as any).mammoth) return (window as any).mammoth
+  return new Promise((resolve, reject) => {
+    const script = document.createElement('script')
+    script.src = MAMMOTH_CDN
+    script.onload = () => {
+      const lib = (window as any).mammoth
+      if (lib) {
+        resolve(lib)
+      } else {
+        reject(new Error('Mammoth.js failed to load'))
+      }
+    }
+    script.onerror = () => reject(new Error('Failed to load Mammoth.js from CDN'))
+    document.head.appendChild(script)
+  })
+}
+
+// ===== INDEXEDDB STORAGE =====
+const DB_NAME = 'bookshelf_db'
+const STORE_NAME = 'book_files'
+
+function openDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, 1)
+    request.onupgradeneeded = (e) => {
+      const db = (e.target as IDBOpenDBRequest).result
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME, { keyPath: 'id' })
+      }
+    }
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error)
+  })
+}
+
+async function saveFileData(id: string, data: string): Promise<void> {
+  const db = await openDB()
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite')
+    tx.objectStore(STORE_NAME).put({ id, data })
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+  })
+}
+
+async function getFileData(id: string): Promise<string | null> {
+  const db = await openDB()
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readonly')
+    const request = tx.objectStore(STORE_NAME).get(id)
+    request.onsuccess = () => resolve(request.result?.data ?? null)
+    request.onerror = () => reject(request.error)
+  })
+}
+
+async function deleteFileData(id: string): Promise<void> {
+  try {
+    const db = await openDB()
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite')
+      tx.objectStore(STORE_NAME).delete(id)
+      tx.oncomplete = () => resolve()
+      tx.onerror = () => reject(tx.error)
+    })
+  } catch {
+    // silently ignore
+  }
+}
+
+// ===== FILE PROCESSING =====
+function splitIntoPages(text: string, charsPerPage: number): string[] {
+  if (!text) return ['']
+  const paragraphs = text.split(/\n\n+/)
+  const pages: string[] = []
+  let current = ''
+
+  for (const para of paragraphs) {
+    if (current.length + para.length + 2 > charsPerPage && current.length > 0) {
+      pages.push(current.trim())
+      current = para
+    } else {
+      current += (current ? '\n\n' : '') + para
+    }
+  }
+  if (current.trim()) pages.push(current.trim())
+  return pages.length > 0 ? pages : ['']
+}
+
+async function processFile(file: File, onStatus: (msg: string) => void): Promise<{
+  content: string
+  htmlContent: string
+  pdfDataBase64: string
+  totalPdfPages: number
+  pages: string[]
+  chapters: Chapter[]
+  fileType: 'pdf' | 'docx' | 'txt'
+}> {
+  const ext = file.name.split('.').pop()?.toLowerCase()
+
+  if (ext === 'pdf') {
+    onStatus('Loading PDF engine...')
+    const pdfjsLib = await loadPdfJs()
+
+    onStatus('Reading PDF file...')
+    const arrayBuffer = await file.arrayBuffer()
+
+    // Convert to base64 for IndexedDB storage
+    const uint8 = new Uint8Array(arrayBuffer)
+    let binaryStr = ''
+    const chunkSize = 8192
+    for (let i = 0; i < uint8.length; i += chunkSize) {
+      const chunk = uint8.subarray(i, Math.min(i + chunkSize, uint8.length))
+      binaryStr += String.fromCharCode.apply(null, Array.from(chunk))
+    }
+    const base64 = btoa(binaryStr)
+
+    onStatus('Parsing PDF pages...')
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise
+    const totalPages = pdf.numPages
+
+    let fullText = ''
+    const chapters: Chapter[] = []
+
+    for (let i = 1; i <= totalPages; i++) {
+      onStatus(`Extracting text from page ${i} of ${totalPages}...`)
+      const page = await pdf.getPage(i)
+      const textContent = await page.getTextContent()
+      const pageText = textContent.items.map((item: any) => item.str).join(' ')
+      fullText += `\n--- Page ${i} ---\n${pageText}`
+
+      const chapterMatch = pageText.match(/^(Chapter|Part|Section|CHAPTER|PART)\s+[\dIVXLCDM]+[.:\s]+(.*)/m)
+      if (chapterMatch) {
+        chapters.push({ title: chapterMatch[0].trim().substring(0, 80), startIndex: i - 1 })
+      }
+    }
+
+    onStatus('Detecting chapters...')
+
+    return {
+      content: fullText,
+      htmlContent: '',
+      pdfDataBase64: base64,
+      totalPdfPages: totalPages,
+      pages: [],
+      chapters,
+      fileType: 'pdf',
+    }
+  }
+
+  if (ext === 'docx') {
+    onStatus('Loading DOCX converter...')
+    const mammoth = await loadMammoth()
+
+    onStatus('Reading DOCX file...')
+    const arrayBuffer = await file.arrayBuffer()
+
+    onStatus('Converting DOCX to HTML...')
+    const result = await mammoth.convertToHtml({ arrayBuffer })
+    const html = result.value || ''
+
+    onStatus('Extracting text content...')
+    const tempDiv = document.createElement('div')
+    tempDiv.innerHTML = html
+    const plainText = tempDiv.textContent || tempDiv.innerText || ''
+
+    onStatus('Splitting into pages...')
+    const pages = splitIntoPages(plainText, 3000)
+
+    onStatus('Detecting chapters...')
+    const chapters: Chapter[] = []
+    const headingRegex = /<h[1-3][^>]*>(.*?)<\/h[1-3]>/gi
+    let match
+    while ((match = headingRegex.exec(html)) !== null) {
+      const headingText = match[1].replace(/<[^>]+>/g, '').trim()
+      if (headingText.length > 2) {
+        const textBefore = html.substring(0, match.index).replace(/<[^>]+>/g, '').length
+        const pageIdx = Math.floor(textBefore / 3000)
+        chapters.push({ title: headingText.substring(0, 80), startIndex: pageIdx })
+      }
+    }
+
+    return {
+      content: plainText,
+      htmlContent: html,
+      pdfDataBase64: '',
+      totalPdfPages: 0,
+      pages,
+      chapters,
+      fileType: 'docx',
+    }
+  }
+
+  // TXT
+  onStatus('Reading text file...')
+  const text = await file.text()
+
+  onStatus('Splitting into pages...')
+  const pages = splitIntoPages(text, 3000)
+
+  onStatus('Detecting chapters...')
+  const chapters: Chapter[] = []
+  text.split('\n').forEach((line, idx) => {
+    if (/^(Chapter|Part|Section)\s/i.test(line.trim())) {
+      const charsBefore = text.split('\n').slice(0, idx).join('\n').length
+      chapters.push({ title: line.trim().substring(0, 80), startIndex: Math.floor(charsBefore / 3000) })
+    }
+  })
+
+  return {
+    content: text,
+    htmlContent: '',
+    pdfDataBase64: '',
+    totalPdfPages: 0,
+    pages,
+    chapters,
+    fileType: 'txt',
+  }
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
 // ===== SAMPLE DATA =====
 const SAMPLE_BOOKS: Book[] = [
   {
@@ -75,7 +330,12 @@ const SAMPLE_BOOKS: Book[] = [
     title: 'The Art of Reading',
     author: 'Mortimer J. Adler',
     fileName: 'art-of-reading.txt',
+    fileType: 'txt',
     content: 'Chapter 1: The Activity and Art of Reading\n\nThis book is for readers and for those who wish to become readers. Particularly, it is for readers of books. More particularly, for those whose main purpose in reading books is to gain increased understanding.\n\nBy readers we mean people who are still growing mentally, people who know that reading, like every other art, is something to be learned and practiced. Such people are usually in their teens, their twenties, or even later. The art of reading has a longer history than the art of writing. In fact, it begins with oral reading and listening.\n\nReading is a complex activity, just as writing is. It consists of a large number of separate acts, all of which must be performed in a good reading. The person who can perform more of these various acts is better able to read.\n\nChapter 2: The Levels of Reading\n\nIn the preceding chapter, we mentioned the goals a reader can pursue. We said that a reader can read for entertainment, for information, or for understanding. We also said that this book would be mainly concerned with reading for understanding.\n\nThere are four levels of reading. The higher levels include the lower, so that the fourth and highest level of reading includes all the others. They are cumulative, not exclusive.\n\nThe first level of reading we will call Elementary Reading. Other names might be rudimentary reading, basic reading, or initial reading. This is the level of reading learned in elementary school. At this level, the question asked of the reader is: What does the sentence say?\n\nThe second level of reading we will call Inspectional Reading. It is characterized by its special emphasis on time. When reading at this level, the student is allowed a set time to complete an assigned reading. The aim is to get the most out of the book within a given time.\n\nChapter 3: The First Level of Reading\n\nWe have said that the first level of reading is called elementary reading. A person who has mastered this level is simply able to read. He has learned the rudiments of the art of reading, has received basic training in reading, and can read at an initial level.\n\nAt this level of reading, the question asked of the reader is: What does the sentence say? That question may seem simple, but it is actually quite complex. It involves all the problems of recognizing individual words and phrases, of grasping the meaning of sentences, and of following the thread of an argument through a series of sentences.',
+    htmlContent: '',
+    pdfDataBase64: '',
+    totalPdfPages: 0,
+    pages: [],
     chapters: [
       { title: 'Chapter 1: The Activity and Art of Reading', startIndex: 0 },
       { title: 'Chapter 2: The Levels of Reading', startIndex: 1 },
@@ -86,14 +346,20 @@ const SAMPLE_BOOKS: Book[] = [
     uploadDate: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(),
     coverColor: '#8B6F47',
     bookmarks: [0, 2],
-    currentPage: 1
+    currentPage: 1,
+    fileSize: 2048,
   },
   {
     id: 'sample-2',
     title: 'Notes on Writing Well',
     author: 'William Zinsser',
-    fileName: 'writing-well.txt',
+    fileName: 'writing-well.docx',
+    fileType: 'docx',
     content: 'Part I: Principles\n\nChapter 1: The Transaction\n\nA school in Connecticut once held a day devoted to the arts. The man who ran the school wanted his students to understand that the arts are not combative, that they are a way of approaching life.\n\nI was asked if I would conduct a writing clinic. Several hundred students and their parents came and sat in the auditorium. I braced myself for the session, for I knew something they did not know: I was going to be the first speaker.\n\nAnother writer had been asked to participate as well. He was a surgeon by profession, a man who had recently begun to write, and his book about his experience had been a best-seller. We were supposed to offer different perspectives on writing.\n\nChapter 2: Simplicity\n\nClutter is the disease of American writing. We are a society strangling in unnecessary words, circular constructions, pompous frills and meaningless jargon. Who can understand the clotted language of everyday American commerce: the memo, the corporation report, the business letter, the notice from the bank explaining its latest change in policy?\n\nThe secret of good writing is to strip every sentence to its cleanest components. Every word that serves no function, every long word that could be a short word, every adverb that carries the same meaning that is already in the verb - these are the thousand and one adulterants that weaken the strength of a sentence.',
+    htmlContent: '<h1>Part I: Principles</h1><h2>Chapter 1: The Transaction</h2><p>A school in Connecticut once held a day devoted to the arts. The man who ran the school wanted his students to understand that the arts are not combative, that they are a way of approaching life.</p><p>I was asked if I would conduct a writing clinic. Several hundred students and their parents came and sat in the auditorium.</p><h2>Chapter 2: Simplicity</h2><p>Clutter is the disease of American writing. We are a society strangling in unnecessary words, circular constructions, pompous frills and meaningless jargon.</p><p>The secret of good writing is to strip every sentence to its cleanest components.</p>',
+    pdfDataBase64: '',
+    totalPdfPages: 0,
+    pages: [],
     chapters: [
       { title: 'Part I: Principles', startIndex: 0 },
       { title: 'Chapter 1: The Transaction', startIndex: 0 },
@@ -104,25 +370,32 @@ const SAMPLE_BOOKS: Book[] = [
     uploadDate: new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString(),
     coverColor: '#6B8E6B',
     bookmarks: [1],
-    currentPage: 0
+    currentPage: 0,
+    fileSize: 45000,
   },
   {
     id: 'sample-3',
     title: 'Thinking, Fast and Slow',
     author: 'Daniel Kahneman',
-    fileName: 'thinking-fast-slow.txt',
+    fileName: 'thinking-fast-slow.pdf',
+    fileType: 'pdf',
     content: 'Introduction\n\nEvery author, I suppose, has in mind a setting in which readers of his or her work could benefit from having read it. Mine is the proverbial office watercooler, where opinions are shared and gossip is exchanged.\n\nI hope to enrich the vocabulary that people use when they talk about the judgments and choices of others, the company policies, or their own lives. Why be concerned with gossip? Because it is much easier, as well as far more enjoyable, to identify and label the mistakes of others than to recognize our own.\n\nPart I: Two Systems\n\nChapter 1: The Characters of the Story\n\nTo observe your mind in automatic mode, glance at the image below. Your experience as you look at the picture is an effortless and instantaneous impression of a woman with dark hair showing anger or readiness to shout. You did not intend to assess her mood or her appearance. The image came to your mind automatically.\n\nThe mental work that produces impressions, intuitions, and many decisions goes on in silence in our mind. Much of the thinking that guides our actions is of this kind. System 1 operates automatically and quickly, with little or no effort and no sense of voluntary control.',
+    htmlContent: '',
+    pdfDataBase64: '',
+    totalPdfPages: 412,
+    pages: [],
     chapters: [
       { title: 'Introduction', startIndex: 0 },
-      { title: 'Part I: Two Systems', startIndex: 1 },
-      { title: 'Chapter 1: The Characters of the Story', startIndex: 1 }
+      { title: 'Part I: Two Systems', startIndex: 3 },
+      { title: 'Chapter 1: The Characters of the Story', startIndex: 5 }
     ],
     progress: 12,
     lastRead: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString(),
     uploadDate: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString(),
     coverColor: '#7B6B8E',
     bookmarks: [],
-    currentPage: 0
+    currentPage: 0,
+    fileSize: 4200000,
   }
 ]
 
@@ -196,13 +469,9 @@ function timeAgo(dateStr: string): string {
   return `${weeks}w ago`
 }
 
-function getPages(content: string): string[] {
+function getTextPages(content: string): string[] {
   if (!content) return ['']
-  const pages: string[] = []
-  for (let i = 0; i < content.length; i += PAGES_CHAR_LIMIT) {
-    pages.push(content.substring(i, i + PAGES_CHAR_LIMIT))
-  }
-  return pages.length > 0 ? pages : ['']
+  return splitIntoPages(content, 3000)
 }
 
 function renderMarkdown(text: string) {
@@ -244,8 +513,14 @@ const HIGHLIGHT_BORDER_COLORS: Record<string, string> = {
   pink: 'border-l-pink-400',
 }
 
+const FILE_TYPE_COLORS: Record<string, string> = {
+  pdf: 'bg-red-100 text-red-700 border-red-200',
+  docx: 'bg-blue-100 text-blue-700 border-blue-200',
+  txt: 'bg-gray-100 text-gray-700 border-gray-200',
+}
+
 // ===== ERROR BOUNDARY =====
-class PageErrorBoundary extends React.Component<
+class ErrorBoundary extends React.Component<
   { children: React.ReactNode },
   { hasError: boolean; error: string }
 > {
@@ -270,6 +545,143 @@ class PageErrorBoundary extends React.Component<
     }
     return this.props.children
   }
+}
+
+// ===== PDF PAGE RENDERER =====
+function PdfPageRenderer({ pdfDataBase64, pageNumber, scale }: {
+  pdfDataBase64: string
+  pageNumber: number
+  scale: number
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const textLayerRef = useRef<HTMLDivElement>(null)
+  const [rendering, setRendering] = useState(true)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    async function render() {
+      setRendering(true)
+      setError('')
+      try {
+        const pdfjsLib = await loadPdfJs()
+        const binaryStr = atob(pdfDataBase64)
+        const bytes = new Uint8Array(binaryStr.length)
+        for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i)
+
+        const pdf = await pdfjsLib.getDocument({ data: bytes.buffer }).promise
+        if (pageNumber < 1 || pageNumber > pdf.numPages) {
+          if (!cancelled) setError(`Page ${pageNumber} out of range (1-${pdf.numPages})`)
+          if (!cancelled) setRendering(false)
+          return
+        }
+        const page = await pdf.getPage(pageNumber)
+        const viewport = page.getViewport({ scale })
+
+        const canvas = canvasRef.current
+        if (!canvas || cancelled) return
+        canvas.width = viewport.width
+        canvas.height = viewport.height
+
+        const ctx = canvas.getContext('2d')
+        if (!ctx) return
+
+        await page.render({ canvasContext: ctx, viewport }).promise
+
+        // Build text layer for text selection
+        const textContent = await page.getTextContent()
+        if (textLayerRef.current && !cancelled) {
+          textLayerRef.current.innerHTML = ''
+          textLayerRef.current.style.width = viewport.width + 'px'
+          textLayerRef.current.style.height = viewport.height + 'px'
+
+          for (const item of textContent.items) {
+            const ti = item as any
+            if (!ti.str || !ti.transform) continue
+            const tx = ti.transform
+            const span = document.createElement('span')
+            span.textContent = ti.str
+            span.style.position = 'absolute'
+            span.style.left = (tx[4] * scale) + 'px'
+            span.style.bottom = (tx[5] * scale) + 'px'
+            span.style.fontSize = (Math.abs(tx[0]) * scale) + 'px'
+            span.style.fontFamily = 'sans-serif'
+            span.style.color = 'transparent'
+            span.style.lineHeight = '1'
+            textLayerRef.current.appendChild(span)
+          }
+        }
+      } catch (err: any) {
+        if (!cancelled) setError(err?.message || 'Failed to render PDF page')
+      } finally {
+        if (!cancelled) setRendering(false)
+      }
+    }
+    if (pdfDataBase64) render()
+    return () => { cancelled = true }
+  }, [pdfDataBase64, pageNumber, scale])
+
+  if (!pdfDataBase64) {
+    return (
+      <div className="flex items-center justify-center py-20">
+        <div className="text-center">
+          <FiLoader className="w-6 h-6 animate-spin text-primary mx-auto mb-2" />
+          <p className="text-sm text-muted-foreground">Loading PDF data...</p>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="relative inline-block mx-auto">
+      {rendering && (
+        <div className="absolute inset-0 flex items-center justify-center bg-card/80 z-10 rounded">
+          <div className="flex flex-col items-center gap-2">
+            <div className="w-6 h-6 border-2 border-primary border-t-transparent rounded-full animate-spin" />
+            <p className="text-xs text-muted-foreground">Rendering page {pageNumber}...</p>
+          </div>
+        </div>
+      )}
+      {error && (
+        <div className="p-6 text-center">
+          <p className="text-destructive text-sm">{error}</p>
+        </div>
+      )}
+      <canvas ref={canvasRef} className="shadow-lg rounded border border-border max-w-full" style={{ maxWidth: '100%', height: 'auto' }} />
+      <div ref={textLayerRef} className="absolute top-0 left-0 select-text pointer-events-auto overflow-hidden" />
+    </div>
+  )
+}
+
+// ===== DOCX RENDERER =====
+function DocxRenderer({ htmlContent, fontSize, lineHeight, fontFamily }: {
+  htmlContent: string
+  fontSize: number
+  lineHeight: number
+  fontFamily: 'serif' | 'sans'
+}) {
+  const containerRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!containerRef.current) return
+    // Inject scoped styles for DOCX content
+    const existingStyle = containerRef.current.querySelector('style[data-docx]')
+    if (existingStyle) existingStyle.remove()
+  }, [htmlContent])
+
+  return (
+    <div ref={containerRef}>
+      <div
+        className="prose prose-sm max-w-none select-text"
+        style={{
+          fontSize: `${fontSize}px`,
+          lineHeight,
+          fontFamily: fontFamily === 'serif' ? 'Georgia, "Times New Roman", serif' : 'system-ui, -apple-system, sans-serif',
+        }}
+        dangerouslySetInnerHTML={{ __html: htmlContent || '<p>No content available</p>' }}
+      />
+    </div>
+  )
 }
 
 // ===== SIDEBAR NAV =====
@@ -348,17 +760,19 @@ function UploadDropzone({ onUpload, uploading, statusMsg }: {
       <input ref={fileRef} type="file" accept=".pdf,.docx,.txt" onChange={handleChange} className="hidden" />
       {uploading ? (
         <div className="flex flex-col items-center gap-2">
-          <div className="w-6 h-6 border-2 border-primary border-t-transparent rounded-full animate-spin" />
-          <p className="text-sm text-muted-foreground">Uploading and processing...</p>
+          <FiLoader className="w-6 h-6 text-primary animate-spin" />
+          <p className="text-sm text-muted-foreground">{statusMsg || 'Processing...'}</p>
         </div>
       ) : (
         <div className="flex flex-col items-center gap-2">
           <FiUpload className="w-8 h-8 text-muted-foreground" />
           <p className="text-sm font-medium text-foreground">Drop a book here or click to upload</p>
-          <p className="text-xs text-muted-foreground">Supports PDF, DOCX, TXT</p>
+          <p className="text-xs text-muted-foreground">Supports PDF, DOCX, TXT -- with full content extraction</p>
         </div>
       )}
-      {statusMsg && <p className={cn("text-xs mt-2", statusMsg.toLowerCase().includes('error') || statusMsg.toLowerCase().includes('unsupported') ? "text-destructive" : "text-primary")}>{statusMsg}</p>}
+      {!uploading && statusMsg && (
+        <p className={cn("text-xs mt-2", statusMsg.toLowerCase().includes('error') || statusMsg.toLowerCase().includes('unsupported') ? "text-destructive" : "text-primary")}>{statusMsg}</p>
+      )}
     </div>
   )
 }
@@ -369,12 +783,25 @@ function BookCard({ book, onClick, onDelete }: {
   onClick: () => void
   onDelete: (e: React.MouseEvent) => void
 }) {
+  const fileTypeColor = FILE_TYPE_COLORS[book.fileType] ?? FILE_TYPE_COLORS.txt
+  const pageCount = book.fileType === 'pdf' ? book.totalPdfPages : (Array.isArray(book.pages) ? book.pages.length : 0)
+  const pagesFromContent = pageCount > 0 ? pageCount : Math.max(1, Math.ceil((book.content?.length ?? 0) / 3000))
+
   return (
     <Card className="group cursor-pointer transition-all duration-300 hover:shadow-lg hover:-translate-y-1 overflow-hidden bg-card" onClick={onClick}>
       <div className="h-36 flex items-end p-4 relative" style={{ backgroundColor: book.coverColor }}>
         <div className="flex-1">
-          <FiBookOpen className="w-8 h-8 text-white/80 mb-2" />
+          {book.fileType === 'pdf' ? (
+            <FiFile className="w-8 h-8 text-white/80 mb-2" />
+          ) : book.fileType === 'docx' ? (
+            <FiFileText className="w-8 h-8 text-white/80 mb-2" />
+          ) : (
+            <FiBookOpen className="w-8 h-8 text-white/80 mb-2" />
+          )}
         </div>
+        <Badge className={cn("absolute top-2 left-2 text-[10px] font-semibold border", fileTypeColor)}>
+          {book.fileType.toUpperCase()}
+        </Badge>
         <button onClick={onDelete} className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity p-1.5 rounded-md bg-black/20 hover:bg-black/40 text-white">
           <FiTrash2 className="w-3.5 h-3.5" />
         </button>
@@ -387,6 +814,10 @@ function BookCard({ book, onClick, onDelete }: {
           <span>{book.progress}%</span>
         </div>
         <Progress value={book.progress} className="h-1" />
+        <div className="flex items-center justify-between text-[10px] text-muted-foreground/70 pt-0.5">
+          <span>{pagesFromContent} {book.fileType === 'pdf' ? 'pages' : 'sections'}</span>
+          <span>{formatFileSize(book.fileSize)}</span>
+        </div>
       </CardContent>
     </Card>
   )
@@ -566,7 +997,7 @@ function LibraryScreen({ books, onSelectBook, onUpload, uploading, uploadStatus,
               {searchQuery ? 'No books found' : 'Upload your first book'}
             </h3>
             <p className="text-sm text-muted-foreground max-w-xs">
-              {searchQuery ? 'Try a different search term' : 'Start building your personal library by uploading a PDF, DOCX, or TXT file'}
+              {searchQuery ? 'Try a different search term' : 'Start building your personal library by uploading a PDF, DOCX, or TXT file. PDFs and DOCX files are fully parsed with real content extraction.'}
             </p>
             {!searchQuery && !showUpload && (
               <Button onClick={() => setShowUpload(true)} className="mt-4 gap-1.5" size="sm">
@@ -583,29 +1014,36 @@ function LibraryScreen({ books, onSelectBook, onUpload, uploading, uploadStatus,
           </div>
         ) : (
           <div className="space-y-2">
-            {filteredBooks.map((book) => (
-              <Card key={book.id} className="cursor-pointer hover:shadow-md transition-all duration-200 bg-card" onClick={() => onSelectBook(book)}>
-                <CardContent className="p-3 flex items-center gap-4">
-                  <div className="w-10 h-14 rounded flex-shrink-0 flex items-center justify-center" style={{ backgroundColor: book.coverColor }}>
-                    <FiBookOpen className="w-4 h-4 text-white/80" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <h3 className="font-serif font-semibold text-sm text-card-foreground truncate">{book.title}</h3>
-                    <p className="text-xs text-muted-foreground">{book.author}</p>
-                  </div>
-                  <div className="flex items-center gap-4 flex-shrink-0">
-                    <span className="text-xs text-muted-foreground hidden sm:inline">{timeAgo(book.lastRead)}</span>
-                    <div className="w-20 hidden md:block">
-                      <Progress value={book.progress} className="h-1" />
+            {filteredBooks.map((book) => {
+              const fileTypeColor = FILE_TYPE_COLORS[book.fileType] ?? FILE_TYPE_COLORS.txt
+              return (
+                <Card key={book.id} className="cursor-pointer hover:shadow-md transition-all duration-200 bg-card" onClick={() => onSelectBook(book)}>
+                  <CardContent className="p-3 flex items-center gap-4">
+                    <div className="w-10 h-14 rounded flex-shrink-0 flex items-center justify-center" style={{ backgroundColor: book.coverColor }}>
+                      {book.fileType === 'pdf' ? <FiFile className="w-4 h-4 text-white/80" /> : <FiBookOpen className="w-4 h-4 text-white/80" />}
                     </div>
-                    <span className="text-xs text-muted-foreground w-8 text-right">{book.progress}%</span>
-                    <button onClick={(e) => { e.stopPropagation(); onDeleteBook(book.id) }} className="p-1 rounded hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition-colors">
-                      <FiTrash2 className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-                </CardContent>
-              </Card>
-            ))}
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <h3 className="font-serif font-semibold text-sm text-card-foreground truncate">{book.title}</h3>
+                        <Badge className={cn("text-[9px] font-semibold border flex-shrink-0", fileTypeColor)}>{book.fileType.toUpperCase()}</Badge>
+                      </div>
+                      <p className="text-xs text-muted-foreground">{book.author}</p>
+                    </div>
+                    <div className="flex items-center gap-4 flex-shrink-0">
+                      <span className="text-[10px] text-muted-foreground hidden lg:inline">{formatFileSize(book.fileSize)}</span>
+                      <span className="text-xs text-muted-foreground hidden sm:inline">{timeAgo(book.lastRead)}</span>
+                      <div className="w-20 hidden md:block">
+                        <Progress value={book.progress} className="h-1" />
+                      </div>
+                      <span className="text-xs text-muted-foreground w-8 text-right">{book.progress}%</span>
+                      <button onClick={(e) => { e.stopPropagation(); onDeleteBook(book.id) }} className="p-1 rounded hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition-colors">
+                        <FiTrash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </CardContent>
+                </Card>
+              )
+            })}
           </div>
         )}
 
@@ -619,7 +1057,7 @@ function LibraryScreen({ books, onSelectBook, onUpload, uploading, uploadStatus,
               </div>
               <div className="flex-1 min-w-0">
                 <p className="text-xs font-medium text-foreground">Book Chat Agent</p>
-                <p className="text-xs text-muted-foreground truncate">AI-powered Q&A about your uploaded books</p>
+                <p className="text-xs text-muted-foreground truncate">AI-powered Q&A about your uploaded books -- PDF, DOCX, TXT fully supported</p>
               </div>
               <Badge variant="outline" className="text-xs flex-shrink-0">
                 {sampleMode ? 'Sample Mode' : 'Ready'}
@@ -655,21 +1093,64 @@ function ReaderScreen({ book, books, onUpdateBook, highlights, onAddHighlight, c
   const [annotationNote, setAnnotationNote] = useState('')
   const [searchOpen, setSearchOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
+  const [pdfZoom, setPdfZoom] = useState(1.2)
+  const [pdfData, setPdfData] = useState<string | null>(null)
+  const [pdfLoading, setPdfLoading] = useState(false)
+  const [pageInput, setPageInput] = useState('')
   const toolbarTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const contentAreaRef = useRef<HTMLDivElement>(null)
 
-  const pages = useMemo(() => book ? getPages(book.content) : [''], [book])
-  const currentPage = book?.currentPage ?? 0
-  const totalPages = pages.length
+  // Compute pages for text/docx (from book.pages or fallback)
+  const textPages = useMemo(() => {
+    if (!book) return ['']
+    if (book.fileType === 'pdf') return []
+    if (Array.isArray(book.pages) && book.pages.length > 0) return book.pages
+    return getTextPages(book.content)
+  }, [book])
 
+  const isPdf = book?.fileType === 'pdf'
+  const isDocx = book?.fileType === 'docx'
+  const currentPage = book?.currentPage ?? 0
+  const totalPages = isPdf ? (book?.totalPdfPages ?? 0) : textPages.length
+
+  // Load PDF data from IndexedDB
+  useEffect(() => {
+    if (!book || book.fileType !== 'pdf') {
+      setPdfData(null)
+      return
+    }
+
+    // Check if it's a sample book (no real PDF data)
+    if (book.id.startsWith('sample-')) {
+      setPdfData(null)
+      return
+    }
+
+    let cancelled = false
+    setPdfLoading(true)
+    getFileData(book.id).then((data) => {
+      if (!cancelled) {
+        setPdfData(data)
+        setPdfLoading(false)
+      }
+    }).catch(() => {
+      if (!cancelled) {
+        setPdfData(null)
+        setPdfLoading(false)
+      }
+    })
+    return () => { cancelled = true }
+  }, [book?.id, book?.fileType])
+
+  // Toolbar auto-hide
   useEffect(() => {
     const resetTimer = () => {
       setShowToolbar(true)
       if (toolbarTimer.current) clearTimeout(toolbarTimer.current)
-      toolbarTimer.current = setTimeout(() => setShowToolbar(false), 3000)
+      toolbarTimer.current = setTimeout(() => setShowToolbar(false), 4000)
     }
     const handleMouseMove = (e: MouseEvent) => {
-      if (e.clientY < 100) resetTimer()
+      if (e.clientY < 120) resetTimer()
     }
     window.addEventListener('mousemove', handleMouseMove)
     resetTimer()
@@ -681,10 +1162,11 @@ function ReaderScreen({ book, books, onUpdateBook, highlights, onAddHighlight, c
 
   const goToPage = useCallback((page: number) => {
     if (!book) return
-    const clamped = Math.max(0, Math.min(page, totalPages - 1))
-    const progress = totalPages > 1 ? Math.round((clamped / (totalPages - 1)) * 100) : 100
+    const max = isPdf ? (book.totalPdfPages - 1) : (textPages.length - 1)
+    const clamped = Math.max(0, Math.min(page, max))
+    const progress = max > 0 ? Math.round((clamped / max) * 100) : 100
     onUpdateBook({ ...book, currentPage: clamped, progress, lastRead: new Date().toISOString() })
-  }, [book, totalPages, onUpdateBook])
+  }, [book, isPdf, textPages.length, onUpdateBook])
 
   const toggleBookmark = useCallback(() => {
     if (!book) return
@@ -747,12 +1229,17 @@ function ReaderScreen({ book, books, onUpdateBook, highlights, onAddHighlight, c
     return highlights.filter(h => h.bookId === book.id && h.pageIndex === currentPage)
   }, [highlights, book, currentPage])
 
-  const renderPageContent = useCallback((text: string) => {
+  const renderTextContent = useCallback((text: string) => {
     if (!text) return null
 
     const renderLine = (line: string, i: number) => {
       if (!line.trim()) return <br key={i} />
       const isHeader = /^(Chapter|Part|Section)\s/i.test(line.trim())
+      const isPageMarker = /^--- Page \d+ ---$/.test(line.trim())
+
+      if (isPageMarker) {
+        return <div key={i} className="text-xs text-muted-foreground/50 text-center my-4 border-t border-border/30 pt-2">{line.trim()}</div>
+      }
 
       let lineElements: React.ReactNode[] = [line]
       for (const h of pageHighlights) {
@@ -787,6 +1274,14 @@ function ReaderScreen({ book, books, onUpdateBook, highlights, onAddHighlight, c
     return text.split('\n').map((line, i) => renderLine(line, i))
   }, [pageHighlights])
 
+  const handlePageInputSubmit = useCallback(() => {
+    const num = parseInt(pageInput, 10)
+    if (!isNaN(num) && num >= 1 && num <= totalPages) {
+      goToPage(isPdf ? num - 1 : num - 1)
+    }
+    setPageInput('')
+  }, [pageInput, totalPages, isPdf, goToPage])
+
   if (!book) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center text-center p-8">
@@ -820,6 +1315,17 @@ function ReaderScreen({ book, books, onUpdateBook, highlights, onAddHighlight, c
             <Tooltip><TooltipTrigger asChild><button onClick={toggleBookmark} className={cn("p-1.5 rounded-full transition-colors", isBookmarked ? "bg-primary text-primary-foreground" : "hover:bg-secondary text-muted-foreground hover:text-foreground")}><FiBookmark className="w-4 h-4" /></button></TooltipTrigger><TooltipContent><p className="text-xs">{isBookmarked ? 'Bookmarked' : 'Bookmark'}</p></TooltipContent></Tooltip>
             <Tooltip><TooltipTrigger asChild><button onClick={() => setShowSettings(true)} className="p-1.5 rounded-full hover:bg-secondary transition-colors text-muted-foreground hover:text-foreground"><FiSettings className="w-4 h-4" /></button></TooltipTrigger><TooltipContent><p className="text-xs">Settings</p></TooltipContent></Tooltip>
             <Tooltip><TooltipTrigger asChild><button onClick={onToggleChat} className={cn("p-1.5 rounded-full transition-colors", chatOpen ? "bg-primary text-primary-foreground" : "hover:bg-secondary text-muted-foreground hover:text-foreground")}><FiMessageSquare className="w-4 h-4" /></button></TooltipTrigger><TooltipContent><p className="text-xs">AI Chat</p></TooltipContent></Tooltip>
+
+            {/* PDF zoom controls */}
+            {isPdf && (
+              <>
+                <Separator orientation="vertical" className="h-5 mx-0.5" />
+                <Tooltip><TooltipTrigger asChild><button onClick={() => setPdfZoom(z => Math.max(0.5, z - 0.1))} className="p-1.5 rounded-full hover:bg-secondary transition-colors text-muted-foreground hover:text-foreground"><FiZoomOut className="w-4 h-4" /></button></TooltipTrigger><TooltipContent><p className="text-xs">Zoom Out</p></TooltipContent></Tooltip>
+                <span className="text-[10px] text-muted-foreground font-mono min-w-[36px] text-center">{Math.round(pdfZoom * 100)}%</span>
+                <Tooltip><TooltipTrigger asChild><button onClick={() => setPdfZoom(z => Math.min(3.0, z + 0.1))} className="p-1.5 rounded-full hover:bg-secondary transition-colors text-muted-foreground hover:text-foreground"><FiZoomIn className="w-4 h-4" /></button></TooltipTrigger><TooltipContent><p className="text-xs">Zoom In</p></TooltipContent></Tooltip>
+                <Tooltip><TooltipTrigger asChild><button onClick={() => setPdfZoom(1.0)} className="p-1.5 rounded-full hover:bg-secondary transition-colors text-muted-foreground hover:text-foreground"><FiMaximize2 className="w-3.5 h-3.5" /></button></TooltipTrigger><TooltipContent><p className="text-xs">Fit Page</p></TooltipContent></Tooltip>
+              </>
+            )}
           </TooltipProvider>
         </div>
       </div>
@@ -840,6 +1346,14 @@ function ReaderScreen({ book, books, onUpdateBook, highlights, onAddHighlight, c
         {showTOC && (
           <div className="w-64 border-r border-border bg-card p-4 overflow-y-auto flex-shrink-0">
             <h3 className="font-serif font-semibold text-sm mb-3 text-foreground">Contents</h3>
+            {/* File info */}
+            <div className="mb-3 p-2 bg-secondary/50 rounded text-xs text-muted-foreground space-y-1">
+              <div className="flex items-center gap-2">
+                <Badge className={cn("text-[9px] border", FILE_TYPE_COLORS[book.fileType] ?? '')}>{book.fileType.toUpperCase()}</Badge>
+                <span>{formatFileSize(book.fileSize)}</span>
+              </div>
+              <p>{isPdf ? `${book.totalPdfPages} PDF pages` : `${textPages.length} sections`}</p>
+            </div>
             {Array.isArray(book.chapters) && book.chapters.length > 0 ? (
               <div className="space-y-1">
                 {book.chapters.map((ch, idx) => (
@@ -860,7 +1374,7 @@ function ReaderScreen({ book, books, onUpdateBook, highlights, onAddHighlight, c
                   {book.bookmarks.map((bm, idx) => (
                     <button key={idx} onClick={() => goToPage(bm)} className="w-full text-left text-xs px-2 py-1.5 rounded text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors flex items-center gap-1.5">
                       <FiBookmark className="w-3 h-3 text-primary" />
-                      Page {bm + 1}
+                      {isPdf ? `Page ${bm + 1}` : `Section ${bm + 1}`}
                     </button>
                   ))}
                 </div>
@@ -869,14 +1383,86 @@ function ReaderScreen({ book, books, onUpdateBook, highlights, onAddHighlight, c
           </div>
         )}
 
-        {/* Main content */}
+        {/* Main content area */}
         <div className="flex-1 overflow-y-auto" ref={contentAreaRef}>
-          <div className="max-w-2xl mx-auto px-8 py-12 select-text" style={{ fontSize: `${fontSize}px`, lineHeight: lineHeight, fontFamily: fontFamily === 'serif' ? 'Georgia, "Times New Roman", serif' : 'system-ui, -apple-system, sans-serif' }}>
-            <h2 className="font-serif font-bold text-xl mb-1 text-foreground">{book.title}</h2>
-            <p className="text-sm text-muted-foreground mb-8">{book.author}</p>
-            <Separator className="mb-8" />
-            {renderPageContent(pages[currentPage] ?? '')}
-          </div>
+          {/* PDF Rendering */}
+          {isPdf && (
+            <div className="flex flex-col items-center py-8 px-4">
+              <h2 className="font-serif font-bold text-xl mb-1 text-foreground">{book.title}</h2>
+              <p className="text-sm text-muted-foreground mb-4">{book.author}</p>
+
+              {pdfLoading && (
+                <div className="flex flex-col items-center justify-center py-20">
+                  <FiLoader className="w-8 h-8 animate-spin text-primary mb-3" />
+                  <p className="text-sm text-muted-foreground">Loading PDF from storage...</p>
+                </div>
+              )}
+
+              {!pdfLoading && !pdfData && book.id.startsWith('sample-') && (
+                <div className="max-w-2xl mx-auto px-8 py-4 select-text" style={{ fontSize: `${fontSize}px`, lineHeight, fontFamily: fontFamily === 'serif' ? 'Georgia, "Times New Roman", serif' : 'system-ui, -apple-system, sans-serif' }}>
+                  <div className="mb-4 p-3 bg-secondary/50 rounded-lg border border-border">
+                    <p className="text-xs text-muted-foreground">Sample PDF -- showing extracted text preview. Upload a real PDF to see full canvas rendering.</p>
+                  </div>
+                  {renderTextContent(book.content)}
+                </div>
+              )}
+
+              {!pdfLoading && !pdfData && !book.id.startsWith('sample-') && (
+                <div className="text-center py-20">
+                  <FiFile className="w-12 h-12 text-muted-foreground/30 mx-auto mb-3" />
+                  <p className="text-sm text-muted-foreground">PDF data not found in storage. The file may need to be re-uploaded.</p>
+                </div>
+              )}
+
+              {!pdfLoading && pdfData && (
+                <PdfPageRenderer
+                  pdfDataBase64={pdfData}
+                  pageNumber={currentPage + 1}
+                  scale={pdfZoom}
+                />
+              )}
+            </div>
+          )}
+
+          {/* DOCX Rendering */}
+          {isDocx && (
+            <div className="max-w-2xl mx-auto px-8 py-12 select-text">
+              <h2 className="font-serif font-bold text-xl mb-1 text-foreground">{book.title}</h2>
+              <p className="text-sm text-muted-foreground mb-4">{book.author}</p>
+              <div className="mb-4 flex items-center gap-2">
+                <Badge className={cn("text-[9px] border", FILE_TYPE_COLORS.docx)}>DOCX</Badge>
+                <span className="text-[10px] text-muted-foreground">{formatFileSize(book.fileSize)}</span>
+              </div>
+              <Separator className="mb-8" />
+
+              {book.htmlContent ? (
+                <DocxRenderer
+                  htmlContent={book.htmlContent}
+                  fontSize={fontSize}
+                  lineHeight={lineHeight}
+                  fontFamily={fontFamily}
+                />
+              ) : (
+                <div style={{ fontSize: `${fontSize}px`, lineHeight, fontFamily: fontFamily === 'serif' ? 'Georgia, "Times New Roman", serif' : 'system-ui, -apple-system, sans-serif' }}>
+                  {renderTextContent(textPages[currentPage] ?? '')}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* TXT Rendering */}
+          {!isPdf && !isDocx && (
+            <div className="max-w-2xl mx-auto px-8 py-12 select-text" style={{ fontSize: `${fontSize}px`, lineHeight, fontFamily: fontFamily === 'serif' ? 'Georgia, "Times New Roman", serif' : 'system-ui, -apple-system, sans-serif' }}>
+              <h2 className="font-serif font-bold text-xl mb-1 text-foreground">{book.title}</h2>
+              <p className="text-sm text-muted-foreground mb-4">{book.author}</p>
+              <div className="mb-4 flex items-center gap-2">
+                <Badge className={cn("text-[9px] border", FILE_TYPE_COLORS.txt)}>TXT</Badge>
+                <span className="text-[10px] text-muted-foreground">{formatFileSize(book.fileSize)}</span>
+              </div>
+              <Separator className="mb-8" />
+              {renderTextContent(textPages[currentPage] ?? '')}
+            </div>
+          )}
         </div>
       </div>
 
@@ -885,7 +1471,26 @@ function ReaderScreen({ book, books, onUpdateBook, highlights, onAddHighlight, c
         <Button variant="ghost" size="sm" onClick={() => goToPage(currentPage - 1)} disabled={currentPage === 0} className="gap-1 text-xs">
           <FiChevronLeft className="w-3.5 h-3.5" /> Previous
         </Button>
-        <span className="text-xs text-muted-foreground">Page {currentPage + 1} of {totalPages}</span>
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-muted-foreground">
+            {isPdf ? `Page` : `Section`}
+          </span>
+          <Input
+            value={pageInput}
+            onChange={(e) => setPageInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') handlePageInputSubmit() }}
+            onBlur={handlePageInputSubmit}
+            placeholder={String(currentPage + 1)}
+            className="w-12 h-6 text-xs text-center p-0 border-border bg-background"
+          />
+          <span className="text-xs text-muted-foreground">of {totalPages}</span>
+          {isPdf && (
+            <>
+              <Separator orientation="vertical" className="h-4 mx-1" />
+              <span className="text-[10px] text-muted-foreground">{Math.round(pdfZoom * 100)}%</span>
+            </>
+          )}
+        </div>
         <Button variant="ghost" size="sm" onClick={() => goToPage(currentPage + 1)} disabled={currentPage >= totalPages - 1} className="gap-1 text-xs">
           Next <FiChevronRight className="w-3.5 h-3.5" />
         </Button>
@@ -934,26 +1539,53 @@ function ReaderScreen({ book, books, onUpdateBook, highlights, onAddHighlight, c
             <SheetDescription className="text-xs">Customize your reading experience</SheetDescription>
           </SheetHeader>
           <div className="mt-6 space-y-6">
-            <div>
-              <Label className="text-xs font-medium mb-2 block">Font Family</Label>
-              <div className="flex gap-2">
-                <Button variant={fontFamily === 'serif' ? 'default' : 'outline'} size="sm" onClick={() => setFontFamily('serif')} className="flex-1 font-serif">Serif</Button>
-                <Button variant={fontFamily === 'sans' ? 'default' : 'outline'} size="sm" onClick={() => setFontFamily('sans')} className="flex-1 font-sans">Sans</Button>
+            {!isPdf && (
+              <>
+                <div>
+                  <Label className="text-xs font-medium mb-2 block">Font Family</Label>
+                  <div className="flex gap-2">
+                    <Button variant={fontFamily === 'serif' ? 'default' : 'outline'} size="sm" onClick={() => setFontFamily('serif')} className="flex-1 font-serif">Serif</Button>
+                    <Button variant={fontFamily === 'sans' ? 'default' : 'outline'} size="sm" onClick={() => setFontFamily('sans')} className="flex-1 font-sans">Sans</Button>
+                  </div>
+                </div>
+                <div>
+                  <Label className="text-xs font-medium mb-2 block">Font Size: {fontSize}px</Label>
+                  <Slider value={[fontSize]} onValueChange={(v) => setFontSize(v[0])} min={12} max={24} step={1} />
+                </div>
+                <div>
+                  <Label className="text-xs font-medium mb-2 block">Line Height: {lineHeight.toFixed(1)}</Label>
+                  <Slider value={[lineHeight * 10]} onValueChange={(v) => setLineHeight(v[0] / 10)} min={12} max={24} step={1} />
+                </div>
+              </>
+            )}
+            {isPdf && (
+              <div>
+                <Label className="text-xs font-medium mb-2 block">PDF Zoom: {Math.round(pdfZoom * 100)}%</Label>
+                <Slider value={[pdfZoom * 100]} onValueChange={(v) => setPdfZoom(v[0] / 100)} min={50} max={300} step={5} />
+                <div className="flex gap-2 mt-2">
+                  <Button variant="outline" size="sm" onClick={() => setPdfZoom(1.0)} className="flex-1 text-xs">100%</Button>
+                  <Button variant="outline" size="sm" onClick={() => setPdfZoom(1.5)} className="flex-1 text-xs">150%</Button>
+                  <Button variant="outline" size="sm" onClick={() => setPdfZoom(2.0)} className="flex-1 text-xs">200%</Button>
+                </div>
               </div>
-            </div>
-            <div>
-              <Label className="text-xs font-medium mb-2 block">Font Size: {fontSize}px</Label>
-              <Slider value={[fontSize]} onValueChange={(v) => setFontSize(v[0])} min={12} max={24} step={1} />
-            </div>
-            <div>
-              <Label className="text-xs font-medium mb-2 block">Line Height: {lineHeight.toFixed(1)}</Label>
-              <Slider value={[lineHeight * 10]} onValueChange={(v) => setLineHeight(v[0] / 10)} min={12} max={24} step={1} />
-            </div>
+            )}
             <div>
               <Label className="text-xs font-medium mb-2 block">Reading Mode</Label>
               <div className="flex gap-2">
                 <Button variant={readingMode === 'light' ? 'default' : 'outline'} size="sm" onClick={() => setReadingMode('light')} className="flex-1">Light</Button>
                 <Button variant={readingMode === 'sepia' ? 'default' : 'outline'} size="sm" onClick={() => setReadingMode('sepia')} className="flex-1">Sepia</Button>
+              </div>
+            </div>
+            {/* File info in settings */}
+            <Separator />
+            <div className="space-y-1.5">
+              <Label className="text-xs font-medium block">File Information</Label>
+              <div className="text-xs text-muted-foreground space-y-1 bg-secondary/50 rounded p-2">
+                <p>File: {book.fileName}</p>
+                <p>Type: {book.fileType.toUpperCase()}</p>
+                <p>Size: {formatFileSize(book.fileSize)}</p>
+                <p>{isPdf ? `Pages: ${book.totalPdfPages}` : `Sections: ${textPages.length}`}</p>
+                <p>Chapters: {Array.isArray(book.chapters) ? book.chapters.length : 0}</p>
               </div>
             </div>
           </div>
@@ -1103,6 +1735,29 @@ export default function Page() {
   const [activeAgentId, setActiveAgentId] = useState<string | null>(null)
   const [mounted, setMounted] = useState(false)
 
+  // Helper to safely save to localStorage with quota handling
+  const safeSetLocalStorage = useCallback((key: string, value: any) => {
+    try {
+      const serialized = JSON.stringify(value)
+      localStorage.setItem(key, serialized)
+    } catch (e: any) {
+      // Quota exceeded -- try to save a truncated version for books
+      if (key === 'bookshelf_books' && Array.isArray(value)) {
+        try {
+          const truncated = value.map((b: Book) => ({
+            ...b,
+            content: (b.content || '').substring(0, 100000),
+            htmlContent: (b.htmlContent || '').substring(0, 100000),
+            pdfDataBase64: '', // Never store this in localStorage
+          }))
+          localStorage.setItem(key, JSON.stringify(truncated))
+        } catch {
+          // Still too large -- give up silently
+        }
+      }
+    }
+  }, [])
+
   // Load from localStorage on mount
   useEffect(() => {
     setMounted(true)
@@ -1110,10 +1765,23 @@ export default function Page() {
       const savedBooks = localStorage.getItem('bookshelf_books')
       const savedHighlights = localStorage.getItem('bookshelf_highlights')
       const savedChat = localStorage.getItem('bookshelf_chat')
-      if (savedBooks) setBooks(JSON.parse(savedBooks))
+      if (savedBooks) {
+        const parsed = JSON.parse(savedBooks) as Book[]
+        // Ensure backward compatibility: add new fields if missing
+        const migrated = parsed.map((b: any) => ({
+          ...b,
+          fileType: b.fileType ?? 'txt',
+          htmlContent: b.htmlContent ?? '',
+          pdfDataBase64: '', // Always load from IndexedDB
+          totalPdfPages: b.totalPdfPages ?? 0,
+          pages: Array.isArray(b.pages) ? b.pages : [],
+          fileSize: b.fileSize ?? 0,
+        }))
+        setBooks(migrated)
+      }
       if (savedHighlights) setHighlights(JSON.parse(savedHighlights))
       if (savedChat) setChatMessages(JSON.parse(savedChat))
-    } catch (e) {
+    } catch {
       // silently ignore
     }
   }, [])
@@ -1121,37 +1789,58 @@ export default function Page() {
   // Persist to localStorage
   useEffect(() => {
     if (!mounted || sampleMode) return
-    try { localStorage.setItem('bookshelf_books', JSON.stringify(books)) } catch (e) { /* */ }
-  }, [books, mounted, sampleMode])
+    safeSetLocalStorage('bookshelf_books', books)
+  }, [books, mounted, sampleMode, safeSetLocalStorage])
 
   useEffect(() => {
     if (!mounted || sampleMode) return
-    try { localStorage.setItem('bookshelf_highlights', JSON.stringify(highlights)) } catch (e) { /* */ }
+    try { localStorage.setItem('bookshelf_highlights', JSON.stringify(highlights)) } catch { /* */ }
   }, [highlights, mounted, sampleMode])
 
   useEffect(() => {
     if (!mounted || sampleMode) return
-    try { localStorage.setItem('bookshelf_chat', JSON.stringify(chatMessages)) } catch (e) { /* */ }
+    try { localStorage.setItem('bookshelf_chat', JSON.stringify(chatMessages)) } catch { /* */ }
   }, [chatMessages, mounted, sampleMode])
 
   // Sample mode
   useEffect(() => {
     if (!mounted) return
     if (sampleMode) {
-      setBooks(SAMPLE_BOOKS)
+      // Generate pages for sample books that need them
+      const sampleWithPages = SAMPLE_BOOKS.map(b => ({
+        ...b,
+        pages: (b.fileType !== 'pdf' && (!Array.isArray(b.pages) || b.pages.length === 0))
+          ? splitIntoPages(b.content, 3000)
+          : b.pages,
+      }))
+      setBooks(sampleWithPages)
       setHighlights(SAMPLE_HIGHLIGHTS)
       setChatMessages(SAMPLE_CHAT)
-      setSelectedBook(SAMPLE_BOOKS[0])
+      setSelectedBook(sampleWithPages[0])
     } else {
       try {
         const savedBooks = localStorage.getItem('bookshelf_books')
         const savedHighlights = localStorage.getItem('bookshelf_highlights')
         const savedChat = localStorage.getItem('bookshelf_chat')
-        setBooks(savedBooks ? JSON.parse(savedBooks) : [])
+        if (savedBooks) {
+          const parsed = JSON.parse(savedBooks) as Book[]
+          const migrated = parsed.map((b: any) => ({
+            ...b,
+            fileType: b.fileType ?? 'txt',
+            htmlContent: b.htmlContent ?? '',
+            pdfDataBase64: '',
+            totalPdfPages: b.totalPdfPages ?? 0,
+            pages: Array.isArray(b.pages) ? b.pages : [],
+            fileSize: b.fileSize ?? 0,
+          }))
+          setBooks(migrated)
+        } else {
+          setBooks([])
+        }
         setHighlights(savedHighlights ? JSON.parse(savedHighlights) : [])
         setChatMessages(savedChat ? JSON.parse(savedChat) : [])
         setSelectedBook(null)
-      } catch (e) {
+      } catch {
         setBooks([])
         setHighlights([])
         setChatMessages([])
@@ -1162,55 +1851,66 @@ export default function Page() {
 
   // Upload handler
   const handleUpload = useCallback(async (file: File) => {
-    const validation = validateFile(file)
-    if (!validation.valid) {
-      setUploadStatus(validation.error ?? 'Unsupported file type')
+    const ext = file.name.split('.').pop()?.toLowerCase()
+    if (!['pdf', 'docx', 'txt'].includes(ext || '')) {
+      setUploadStatus('Unsupported file type. Please upload PDF, DOCX, or TXT files.')
       return
     }
+
     setUploading(true)
-    setUploadStatus('')
+    setUploadStatus('Validating file...')
 
     try {
-      const uploadResult = await uploadAndTrainDocument(RAG_ID, file)
+      // Upload to RAG knowledge base for AI chat (fire and forget)
+      setUploadStatus('Uploading to AI knowledge base...')
+      uploadAndTrainDocument(RAG_ID, file).catch(() => {})
 
-      let content = ''
-      if (file.type === 'text/plain') {
-        content = await file.text()
-      } else {
-        content = `[Content from ${file.name}]\n\nThis document has been uploaded and indexed for AI search. Use the chat panel to ask questions about this book.\n\nFile: ${file.name}\nType: ${file.type === 'application/pdf' ? 'PDF' : 'DOCX'}\nSize: ${(file.size / 1024).toFixed(1)} KB`
+      setUploadStatus('Processing file...')
+      const processed = await processFile(file, setUploadStatus)
+
+      const bookId = generateId()
+
+      // Store large PDF data in IndexedDB
+      if (processed.pdfDataBase64) {
+        setUploadStatus('Saving PDF to storage...')
+        await saveFileData(bookId, processed.pdfDataBase64)
       }
 
-      const chapters: Chapter[] = []
-      const lines = content.split('\n')
-      lines.forEach((line) => {
-        if (/^(Chapter|Part|Section)\s/i.test(line.trim())) {
-          const charIdx = content.indexOf(line)
-          const pageIdx = Math.floor(charIdx / PAGES_CHAR_LIMIT)
-          chapters.push({ title: line.trim(), startIndex: pageIdx })
-        }
-      })
+      // Store large DOCX/HTML data in IndexedDB if big
+      if (processed.htmlContent && processed.htmlContent.length > 200000) {
+        await saveFileData(bookId + '_html', processed.htmlContent)
+      }
 
       const titleFromName = file.name.replace(/\.(pdf|docx|txt)$/i, '').replace(/[_-]/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
 
+      const pageCount = processed.fileType === 'pdf' ? processed.totalPdfPages : processed.pages.length
+
       const newBook: Book = {
-        id: generateId(),
+        id: bookId,
         title: titleFromName,
-        author: 'Unknown',
+        author: 'Unknown Author',
         fileName: file.name,
-        content,
-        chapters,
+        fileType: processed.fileType,
+        content: processed.content.substring(0, 500000),
+        htmlContent: processed.htmlContent.substring(0, 500000),
+        pdfDataBase64: '', // stored in IndexedDB
+        totalPdfPages: processed.totalPdfPages,
+        pages: processed.pages.length > 200 ? processed.pages.slice(0, 200) : processed.pages,
+        chapters: processed.chapters,
         progress: 0,
         lastRead: new Date().toISOString(),
         uploadDate: new Date().toISOString(),
         coverColor: COVER_COLORS[Math.floor(Math.random() * COVER_COLORS.length)],
         bookmarks: [],
         currentPage: 0,
+        fileSize: file.size,
       }
 
       setBooks(prev => [newBook, ...prev])
-      setUploadStatus(uploadResult.success ? 'Book uploaded and indexed successfully' : `Uploaded locally. Indexing: ${uploadResult.error ?? 'pending'}`)
-    } catch (err) {
-      setUploadStatus('Error uploading book. Please try again.')
+      setUploadStatus(`"${titleFromName}" uploaded -- ${processed.fileType.toUpperCase()}, ${pageCount} ${processed.fileType === 'pdf' ? 'pages' : 'sections'} extracted`)
+    } catch (err: any) {
+      setUploadStatus(`Error processing file: ${err?.message || 'Unknown error'}. Please try again.`)
+      console.error('File processing error:', err)
     } finally {
       setUploading(false)
     }
@@ -1220,6 +1920,9 @@ export default function Page() {
     setBooks(prev => prev.filter(b => b.id !== id))
     setHighlights(prev => prev.filter(h => h.bookId !== id))
     if (selectedBook?.id === id) setSelectedBook(null)
+    // Clean up IndexedDB
+    deleteFileData(id).catch(() => {})
+    deleteFileData(id + '_html').catch(() => {})
   }, [selectedBook])
 
   const handleUpdateBook = useCallback((updated: Book) => {
@@ -1273,7 +1976,7 @@ export default function Page() {
         }
         setChatMessages(prev => [...prev, errorMsg])
       }
-    } catch (err) {
+    } catch {
       const errorMsg: ChatMessage = {
         id: generateId(),
         role: 'assistant',
@@ -1339,13 +2042,14 @@ export default function Page() {
   }
 
   return (
-    <PageErrorBoundary>
+    <ErrorBoundary>
       <div className="min-h-screen h-screen flex flex-col bg-background text-foreground">
         {/* Header */}
         <header className="h-12 border-b border-border bg-card flex items-center justify-between px-4 flex-shrink-0 z-10">
           <div className="flex items-center gap-2">
             <FiBook className="w-5 h-5 text-primary" />
             <span className="font-serif font-semibold text-foreground tracking-tight">BookShelf</span>
+            <Badge variant="outline" className="text-[9px] ml-1">PDF / DOCX / TXT</Badge>
           </div>
           <div className="flex items-center gap-3">
             <div className="flex items-center gap-2">
@@ -1380,6 +2084,6 @@ export default function Page() {
         {/* Chat panel */}
         <ChatPanel open={chatOpen} onClose={() => setChatOpen(false)} chatMessages={chatMessages} onSend={handleChatSend} loading={chatLoading} />
       </div>
-    </PageErrorBoundary>
+    </ErrorBoundary>
   )
 }
